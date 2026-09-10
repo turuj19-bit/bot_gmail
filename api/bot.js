@@ -64,16 +64,40 @@ function maskUsername(u) {
   if (u.length <= 2) return '@' + u[0] + '*';
   return '@' + u.slice(0, 2) + '*'.repeat(Math.max(1, u.length - 2));
 }
+// Cegah teks dari database (produk/pengaturan yang diisi manual oleh admin) merusak
+// parsing HTML Telegram atau membentuk tag <a> yang tidak diinginkan (mis. jadi link nyasar).
+function escapeHtml(str) {
+  return String(str == null ? '' : str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+// Edit pesan (caption foto ATAU teks biasa) dengan aman. Kalau isinya persis sama seperti
+// sebelumnya, Telegram akan menolak dengan error "message is not modified" — ini BUKAN
+// error sungguhan, jadi diabaikan saja (bukan penyebab tombol "tidak berfungsi").
+// Kalau gagal karena sebab lain, kirim pesan baru sebagai fallback terakhir supaya user
+// selalu melihat hasil, tidak macet diam-diam.
+async function safeEditScreen(chatId, messageId, text, extra = {}) {
+  const capRes = await tg('editMessageCaption', { chat_id: chatId, message_id: messageId, caption: text, parse_mode: 'HTML', ...extra });
+  if (capRes.ok) return capRes;
+  if (/message is not modified/i.test(capRes.description || '')) return capRes;
+
+  const txtRes = await tg('editMessageText', { chat_id: chatId, message_id: messageId, text, parse_mode: 'HTML', disable_web_page_preview: true, ...extra });
+  if (txtRes.ok) return txtRes;
+  if (/message is not modified/i.test(txtRes.description || '')) return txtRes;
+
+  console.error('safeEditScreen gagal total:', capRes.description, '|', txtRes.description);
+  return tgSend(chatId, text, extra).catch(() => {});
+}
 
 // ---------------- USER & SESSION ----------------
 async function getOrCreateUser(tgUser) {
   const { data: existing } = await supabase.from('users').select('*').eq('tg_id', tgUser.id).maybeSingle();
   if (existing) {
-    await supabase.from('users').update({
+    // Update data profil dilakukan di background (tidak di-await) supaya user tidak
+    // menunggu write yang tidak memengaruhi hasil balasan — ini mempercepat respons bot.
+    supabase.from('users').update({
       username: tgUser.username || null,
       fullname: [tgUser.first_name, tgUser.last_name].filter(Boolean).join(' '),
       last_seen_at: new Date().toISOString()
-    }).eq('tg_id', tgUser.id);
+    }).eq('tg_id', tgUser.id).then(() => {}, () => {});
     return existing;
   }
   const { data: created } = await supabase.from('users').insert({
@@ -82,8 +106,7 @@ async function getOrCreateUser(tgUser) {
     fullname: [tgUser.first_name, tgUser.last_name].filter(Boolean).join(' '),
     saldo: 0
   }).select().single();
-  await supabase.rpc('noop').catch(() => {}); // no-op guard (aman kalau rpc tak ada)
-  await incrStat('total_users', 1);
+  incrStat('total_users', 1).catch(() => {}); // background, tidak menahan balasan /start
   return created;
 }
 async function incrStat(key, by) {
@@ -133,11 +156,13 @@ async function calcTotal(subtotal) {
 
 // ---------------- RENDER: MAIN MENU ----------------
 async function renderMainMenu(user) {
-  const s = await getSettings();
-  const totalUsers = await getStat('total_users');
-  const totalTx = await getStat('total_tx_success');
-  const totalItem = await getStat('total_item_terjual');
-  const welcome = (s.welcome_text || 'Selamat datang di ✨ {bot_username} ✨').replace('{bot_username}', s.bot_username || '');
+  const [s, totalUsers, totalTx, totalItem] = await Promise.all([
+    getSettings(),
+    getStat('total_users'),
+    getStat('total_tx_success'),
+    getStat('total_item_terjual')
+  ]);
+  const welcome = escapeHtml(s.welcome_text || 'Selamat datang di ✨ {bot_username} ✨').replace('{bot_username}', escapeHtml(s.bot_username || ''));
   const text =
     `${welcome}\n` +
     `${'─'.repeat(28)}\n\n` +
@@ -165,9 +190,7 @@ async function sendMainMenu(chatId, user) {
 }
 async function editToMainMenu(chatId, messageId, user) {
   const m = await renderMainMenu(user);
-  // Pesan sebelumnya bisa berupa foto (caption) atau teks biasa — coba caption dulu.
-  const r = await tg('editMessageCaption', { chat_id: chatId, message_id: messageId, caption: m.text, parse_mode: 'HTML', reply_markup: m.keyboard });
-  if (!r.ok) await tgEdit(chatId, messageId, m.text, { reply_markup: m.keyboard });
+  return safeEditScreen(chatId, messageId, m.text, { reply_markup: m.keyboard });
 }
 
 // ---------------- RENDER: BELI AKUN ----------------
@@ -187,9 +210,9 @@ async function renderBuyScreen(session) {
 
   const s = await getSettings();
   const text =
-    `✨ ${s.bot_username || ''} ✨\n${'─'.repeat(24)}\n\n` +
-    `📦 Produk: <b>${product.name}</b>\n` +
-    `📝 Deskripsi:\n${product.description || '-'}\n\n` +
+    `✨ ${escapeHtml(s.bot_username || '')} ✨\n${'─'.repeat(24)}\n\n` +
+    `📦 Produk: <b>${escapeHtml(product.name)}</b>\n` +
+    `📝 Deskripsi:\n${escapeHtml(product.description || '-')}\n\n` +
     `💰 Harga saat ini <b>${rp(unit)}</b>/akun\n\n` +
     grosirLine +
     `📦 Stok: <b>${stock}</b> akun\n\n` +
@@ -228,8 +251,7 @@ async function showBuyScreen(chatId, messageId, tgId) {
   const session = await getSession(tgId);
   const r = await renderBuyScreen(session);
   await setSession(tgId, 'buy_menu', r.ctx || session.context);
-  const edited = await tg('editMessageCaption', { chat_id: chatId, message_id: messageId, caption: r.text, parse_mode: 'HTML', reply_markup: r.keyboard });
-  if (!edited.ok) await tgEdit(chatId, messageId, r.text, { reply_markup: r.keyboard });
+  return safeEditScreen(chatId, messageId, r.text, { reply_markup: r.keyboard });
 }
 
 // ---------------- RENDER: KONFIRMASI PEMBELIAN ----------------
@@ -238,17 +260,16 @@ async function showConfirmScreen(chatId, messageId, user, session) {
   const product = await getProduct(ctx.product_id);
   const stock = await getStockCount(product.id);
   if (ctx.qty > stock) {
-    await tgEdit(chatId, messageId, `⚠️ Stok tidak mencukupi. Sisa stok: ${stock} akun.`, {
+    return safeEditScreen(chatId, messageId, `⚠️ Stok tidak mencukupi. Sisa stok: ${stock} akun.`, {
       reply_markup: { inline_keyboard: [[{ text: '⬅️ Kembali', callback_data: 'buy:open' }]] }
     });
-    return;
   }
   const unit = unitPriceFor(product, ctx.qty);
   const subtotal = unit * ctx.qty;
   const text =
     `🛒 <b>Konfirmasi Pembelian</b>\n${'─'.repeat(24)}\n\n` +
-    `📦 <b>${product.name}</b>\n` +
-    `📝 ${product.description || '-'}\n` +
+    `📦 <b>${escapeHtml(product.name)}</b>\n` +
+    `📝 ${escapeHtml(product.description || '-')}\n` +
     `📊 Jumlah: ${ctx.qty} akun\n` +
     `💰 Total: <b>${rp(subtotal)}</b>\n` +
     `💼 Saldo: ${rp(user.saldo)}\n${'─'.repeat(24)}\n\n` +
@@ -261,7 +282,7 @@ async function showConfirmScreen(chatId, messageId, user, session) {
   }
   rows.push([{ text: '💳 Bayar QRIS', callback_data: 'buy:pay:qris' }]);
   rows.push([{ text: '⬅️ Kembali', callback_data: 'buy:open' }]);
-  await tgEdit(chatId, messageId, text, { reply_markup: { inline_keyboard: rows } });
+  return safeEditScreen(chatId, messageId, text, { reply_markup: { inline_keyboard: rows } });
 }
 
 // ---------------- RENDER: ISI SALDO ----------------
@@ -276,8 +297,7 @@ async function showTopupScreen(chatId, messageId, user) {
   const rows = [];
   for (let i = 0; i < btns.length; i += 3) rows.push(btns.slice(i, i + 3));
   rows.push([{ text: '⬅️ Kembali', callback_data: 'back:main' }]);
-  const edited = await tg('editMessageCaption', { chat_id: chatId, message_id: messageId, caption: text, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
-  if (!edited.ok) await tgEdit(chatId, messageId, text, { reply_markup: { inline_keyboard: rows } });
+  return safeEditScreen(chatId, messageId, text, { reply_markup: { inline_keyboard: rows } });
 }
 
 // ---------------- RIWAYAT / MUTASI / GARANSI ----------------
@@ -293,14 +313,14 @@ async function showHistory(chatId, messageId, tgId) {
       return `${icon[t.status] || '•'} <b>${label}</b> | ${rp(t.total)}\n📅 ${fmtDateShort(t.created_at)} | ${t.status}`;
     }).join('\n\n');
   }
-  await tgEdit(chatId, messageId, text, { reply_markup: { inline_keyboard: [[{ text: '⬅️ Kembali', callback_data: 'back:main' }]] } });
+  return safeEditScreen(chatId, messageId, text, { reply_markup: { inline_keyboard: [[{ text: '⬅️ Kembali', callback_data: 'back:main' }]] } });
 }
 async function showMutasi(chatId, messageId, tgId) {
   const { data } = await supabase.from('mutations').select('*').eq('user_tg_id', tgId).order('created_at', { ascending: false }).limit(10);
   let text = `📈 <b>Mutasi Saldo</b>\n${'─'.repeat(24)}\n\n`;
   text += (!data || !data.length) ? '📭 Belum ada mutasi.' :
-    data.map(m => `${m.type === 'credit' ? '➕' : '➖'} ${rp(m.amount)} — ${m.note || '-'}\n📅 ${fmtDateShort(m.created_at)}`).join('\n\n');
-  await tgEdit(chatId, messageId, text, { reply_markup: { inline_keyboard: [[{ text: '⬅️ Kembali', callback_data: 'back:main' }]] } });
+    data.map(m => `${m.type === 'credit' ? '➕' : '➖'} ${rp(m.amount)} — ${escapeHtml(m.note || '-')}\n📅 ${fmtDateShort(m.created_at)}`).join('\n\n');
+  return safeEditScreen(chatId, messageId, text, { reply_markup: { inline_keyboard: [[{ text: '⬅️ Kembali', callback_data: 'back:main' }]] } });
 }
 async function showGaransi(chatId, messageId, tgId) {
   const { data } = await supabase.from('transactions').select('*').eq('user_tg_id', tgId).eq('type', 'purchase').eq('status', 'success').gt('warranty_until', new Date().toISOString()).order('created_at', { ascending: false });
@@ -309,12 +329,12 @@ async function showGaransi(chatId, messageId, tgId) {
   if (!data || !data.length) {
     text += 'Tidak ada pembelian yang masih dalam masa garansi.\n\nJika ada masalah lain, silakan hubungi admin langsung.';
   } else {
-    text += data.map(t => `📦 ${t.product_name} x${t.qty} — ID: <code>${t.id.slice(0, 8)}</code>\n⏳ Garansi s/d ${fmtDate(t.warranty_until)}`).join('\n\n');
+    text += data.map(t => `📦 ${escapeHtml(t.product_name)} x${t.qty} — ID: <code>${t.id.slice(0, 8)}</code>\n⏳ Garansi s/d ${fmtDate(t.warranty_until)}`).join('\n\n');
   }
   const s = await getSettings();
   rows.push([{ text: '💬 Hubungi Admin', url: s.admin_link || 't.me/' }]);
   rows.push([{ text: '⬅️ Kembali', callback_data: 'back:main' }]);
-  await tgEdit(chatId, messageId, text, { reply_markup: { inline_keyboard: rows } });
+  return safeEditScreen(chatId, messageId, text, { reply_markup: { inline_keyboard: rows } });
 }
 
 // ---------------- MIDTRANS: BUAT TAGIHAN QRIS ----------------
@@ -355,7 +375,7 @@ async function createQrisInvoice({ chatId, messageId, user, type, product, qty, 
     expires_at: expiresAt
   }).select().single();
 
-  const label = type === 'purchase' ? `Produk: ${product.name}\n📝 Jumlah: ${qty} akun\n💰 Harga: ${rp(subtotal)}` : `Produk: Top Up Saldo\n💰 Nominal: ${rp(subtotal)}`;
+  const label = type === 'purchase' ? `Produk: ${escapeHtml(product.name)}\n📝 Jumlah: ${qty} akun\n💰 Harga: ${rp(subtotal)}` : `Produk: Top Up Saldo\n💰 Nominal: ${rp(subtotal)}`;
   const invoiceText =
     `🧾 <b>TAGIHAN PEMBAYARAN</b>\n${'─'.repeat(24)}\n\n` +
     `💳 Metode: QRIS\n` +
@@ -390,7 +410,7 @@ async function processSuccessPurchase(tx, viaSaldo) {
   const { data: items } = await supabase.from('stock_items').select('*').eq('product_id', tx.product_id).eq('is_sold', false).order('created_at', { ascending: true }).limit(tx.qty);
   if (!items || items.length < tx.qty) {
     await supabase.from('transactions').update({ status: 'failed' }).eq('id', tx.id);
-    await tgSend(tx.user_tg_id, `⚠️ Maaf, stok <b>${product.name}</b> habis saat proses pengiriman. Dana Anda akan dikembalikan oleh admin. Mohon hubungi admin dengan ID transaksi: <code>${tx.id}</code>`);
+    await tgSend(tx.user_tg_id, `⚠️ Maaf, stok <b>${escapeHtml(product.name)}</b> habis saat proses pengiriman. Dana Anda akan dikembalikan oleh admin. Mohon hubungi admin dengan ID transaksi: <code>${tx.id}</code>`);
     return;
   }
   const ids = items.map(i => i.id);
@@ -402,23 +422,32 @@ async function processSuccessPurchase(tx, viaSaldo) {
   if (viaSaldo) {
     await supabase.from('mutations').insert({ user_tg_id: tx.user_tg_id, type: 'debit', amount: tx.total, note: `Pembelian ${product.name} x${tx.qty}` });
   }
-  await incrStat('total_tx_success', 1);
-  await incrStat('total_item_terjual', tx.qty);
+  incrStat('total_tx_success', 1).catch(() => {});
+  incrStat('total_item_terjual', tx.qty).catch(() => {});
 
-  const akunText = items.map((it, i) => `${i + 1}. <code>${it.content}</code>`).join('\n');
+  const akunText = items.map((it, i) => `${i + 1}. <code>${escapeHtml(it.content)}</code>`).join('\n');
   await tgSend(tx.user_tg_id,
-    `✅ <b>Pembelian berhasil!</b>\n\n📦 ${product.name} x${tx.qty}\n${'─'.repeat(24)}\n${akunText}\n${'─'.repeat(24)}\n` +
+    `✅ <b>Pembelian berhasil!</b>\n\n📦 ${escapeHtml(product.name)} x${tx.qty}\n${'─'.repeat(24)}\n${akunText}\n${'─'.repeat(24)}\n` +
     `🛡️ Garansi s/d: ${fmtDate(warrantyUntil)}\n\nSimpan data akun di atas baik-baik.`
   );
 
   const s = await getSettings();
   if (s.auto_post_testimoni === 'true' && s.channel_link) {
     const { data: buyer } = await supabase.from('users').select('username').eq('tg_id', tx.user_tg_id).maybeSingle();
-    await tg('sendMessage', {
-      chat_id: '@' + s.channel_link.split('/').pop(),
-      text: `🎗️ <b>TESTIMONI PEMBELIAN</b>\n${'─'.repeat(24)}\n\n👤 Pembeli: ${maskUsername(buyer && buyer.username)}\n📦 Produk: ${product.name}\n📝 Jumlah: ${tx.qty} pcs\n${'─'.repeat(24)}\n\nTerima kasih sudah berbelanja! 🤝`,
+    const chatIdChannel = s.channel_link.includes('t.me/') ? '@' + s.channel_link.split('/').pop() : s.channel_link;
+    const r = await tg('sendMessage', {
+      chat_id: chatIdChannel,
+      text: `🎗️ <b>TESTIMONI PEMBELIAN</b>\n${'─'.repeat(24)}\n\n👤 Pembeli: ${maskUsername(buyer && buyer.username)}\n📦 Produk: ${escapeHtml(product.name)}\n📝 Jumlah: ${tx.qty} pcs\n${'─'.repeat(24)}\n\nTerima kasih sudah berbelanja! 🤝`,
       parse_mode: 'HTML'
-    }).catch(() => {});
+    }).catch(e => ({ ok: false, description: String(e) }));
+    if (!r.ok) {
+      // Jangan dibisukan total — log ke console (Vercel logs) & beri tahu admin kalau ada ADMIN_TG_ID,
+      // supaya kegagalan post ke channel (mis. bot belum jadi admin channel) ketahuan, bukan diam-diam gagal.
+      console.error('Gagal kirim testimoni ke channel:', chatIdChannel, r.description);
+      if (ADMIN_CHAT_ID) {
+        tgSend(ADMIN_CHAT_ID, `⚠️ Gagal posting testimoni ke channel (${chatIdChannel}): ${r.description}\nPastikan bot sudah dijadikan admin di channel tersebut.`).catch(() => {});
+      }
+    }
   }
 }
 
@@ -450,8 +479,9 @@ async function handleMessage(msg) {
     return tgSend(chatId, r.text, { reply_markup: r.keyboard });
   }
 
-  // default: tampilkan menu utama biar user tidak nyasar
-  return sendMainMenu(chatId, user);
+  // Pesan/teks sembarangan yang BUKAN /start dan bukan bagian dari alur input aktif
+  // TIDAK memunculkan menu lengkap lagi — cukup diarahkan singkat, sesuai permintaan.
+  return tgSend(chatId, 'Ketik /start untuk membuka menu ✨');
 }
 
 async function handleCallback(cb) {
@@ -460,7 +490,7 @@ async function handleCallback(cb) {
   const tgId = cb.from.id;
   const data = cb.data;
   const user = await getOrCreateUser(cb.from);
-  await tgAnswerCb(cb.id, '');
+  tgAnswerCb(cb.id, '').catch(() => {}); // tidak diawait, biar respons layar tidak menunggu ini
 
   if (data === 'noop') return;
 
@@ -480,7 +510,7 @@ async function handleCallback(cb) {
   if (data === 'buy:manualqty') {
     const session = await getSession(tgId);
     await setSession(tgId, 'awaiting_manual_qty', session.context);
-    return tgEdit(chatId, messageId, '✏️ Ketik jumlah akun yang ingin dibeli (contoh: 25):', { reply_markup: { inline_keyboard: [[{ text: '⬅️ Batal', callback_data: 'buy:open' }]] } }).catch(() => tgSend(chatId, '✏️ Ketik jumlah akun yang ingin dibeli (contoh: 25):'));
+    return safeEditScreen(chatId, messageId, '✏️ Ketik jumlah akun yang ingin dibeli (contoh: 25):', { reply_markup: { inline_keyboard: [[{ text: '⬅️ Batal', callback_data: 'buy:open' }]] } });
   }
   if (data === 'buy:goconfirm') {
     const session = await getSession(tgId);
@@ -492,7 +522,7 @@ async function handleCallback(cb) {
     const product = await getProduct(session.context.product_id);
     const qty = session.context.qty;
     const stock = await getStockCount(product.id);
-    if (qty > stock) return tgEdit(chatId, messageId, `⚠️ Stok tidak mencukupi. Sisa stok: ${stock} akun.`, { reply_markup: { inline_keyboard: [[{ text: '⬅️ Kembali', callback_data: 'buy:open' }]] } });
+    if (qty > stock) return safeEditScreen(chatId, messageId, `⚠️ Stok tidak mencukupi. Sisa stok: ${stock} akun.`, { reply_markup: { inline_keyboard: [[{ text: '⬅️ Kembali', callback_data: 'buy:open' }]] } });
     const unit = unitPriceFor(product, qty);
     const subtotal = unit * qty;
     if (user.saldo < subtotal) return showConfirmScreen(chatId, messageId, user, session);
@@ -511,7 +541,7 @@ async function handleCallback(cb) {
     const product = await getProduct(session.context.product_id);
     const qty = session.context.qty;
     const stock = await getStockCount(product.id);
-    if (qty > stock) return tgEdit(chatId, messageId, `⚠️ Stok tidak mencukupi. Sisa stok: ${stock} akun.`, { reply_markup: { inline_keyboard: [[{ text: '⬅️ Kembali', callback_data: 'buy:open' }]] } });
+    if (qty > stock) return safeEditScreen(chatId, messageId, `⚠️ Stok tidak mencukupi. Sisa stok: ${stock} akun.`, { reply_markup: { inline_keyboard: [[{ text: '⬅️ Kembali', callback_data: 'buy:open' }]] } });
     const unit = unitPriceFor(product, qty);
     const subtotal = unit * qty;
     await createQrisInvoice({ chatId, messageId, user, type: 'purchase', product, qty, subtotal });
